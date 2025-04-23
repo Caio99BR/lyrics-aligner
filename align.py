@@ -3,19 +3,15 @@ Generates .txt-files with phoneme and/or word onsets.
 """
 import argparse
 import os
-import json
-import glob
 import pickle
-import warnings
-warnings.filterwarnings('ignore')
-
 import librosa as lb
 import torch
 import numpy as np
+from praatio import textgrid
 
 import model
 
-def compute_phoneme_onsets(optimal_path_matrix, hop_length, sampling_rate, return_skipped_idx=False):
+def compute_phoneme_onsets(opt_path_matrix, hop_len, samp_rate):
     """
 
     Args:
@@ -26,29 +22,23 @@ def compute_phoneme_onsets(optimal_path_matrix, hop_length, sampling_rate, retur
     Returns:
         phoneme_onsets: list
     """
+    phoneme_idx = np.argmax(opt_path_matrix, axis=1)
 
-    phoneme_indices = np.argmax(optimal_path_matrix, axis=1)
+    # Indices where a phoneme jump occurred (space between two consecutive phonemes)
+    skipped_idx = [x + 1 for i, (x, y) in enumerate(zip(phoneme_idx[:-1], phoneme_idx[1:])) if x == y - 2]
 
-    # find positions that have been skiped:
-    skipped_idx = [x+1 for i, (x, y) in
-                   enumerate(zip(phoneme_indices[:-1], phoneme_indices[1:]))
-                   if x == y - 2]
+    # Indices where phoneme change occurs
+    last_idx_change = [i for i, (x, y) in enumerate(zip(phoneme_idx[:-1], phoneme_idx[1:])) if x != y]
 
-    # compute index of list elements whose right neighbor is different from itself
-    last_idx_before_change = [i for i, (x, y) in
-                              enumerate(zip(phoneme_indices[:-1], phoneme_indices[1:]))
-                              if x != y]
+    phoneme_onsets = [(n + 1) * hop_len / samp_rate for n in last_idx_change]
+    phoneme_onsets.insert(0, 0)  # First phoneme starts at 0s
 
-    phoneme_onsets = [(n + 1) * hop_length / sampling_rate for n in last_idx_before_change]
-    phoneme_onsets.insert(0, 0)  # the first space token's onset is 0
-
-    if return_skipped_idx:
-        return phoneme_onsets, skipped_idx
-    else:
+    if skipped_idx:
         for idx in skipped_idx:
             # set the onset of skipped tokens to the onset of the previous token
-            phoneme_onsets.insert(idx, phoneme_onsets[idx])
-        return phoneme_onsets
+            phoneme_onsets.insert(idx, phoneme_onsets[idx] + (hop_len / samp_rate))
+
+    return phoneme_onsets
 
 def compute_word_alignment(phonemes, phoneme_onsets):
     """
@@ -62,8 +52,7 @@ def compute_word_alignment(phonemes, phoneme_onsets):
         word_offsets: list of word offsets
 
     """
-    word_onsets = []
-    word_offsets = []
+    word_onsets, word_offsets = [], []
 
     for idx, phoneme in enumerate(phonemes):
         if idx == 0:
@@ -91,20 +80,17 @@ def accumulated_cost_numpy(score_matrix, init=None):
     B, N, M = score_matrix.size()
     score_matrix = score_matrix.numpy().astype('float64')
 
-    dtw_matrix = np.ones((N + 1, M + 1)) * -100000
+    dtw_matrix = np.ones((N + 1, M + 1)) * -1e5
     dtw_matrix[0, 0] = init
 
     # Sweep diagonally through alphas (as done in https://github.com/lyprince/sdtw_pytorch/blob/master/sdtw.py)
     # See also https://towardsdatascience.com/gpu-optimized-dynamic-programming-8d5ba3d7064f
-    for (m,n),(m_m1,n_m1) in zip(model.MatrixDiagonalIndexIterator(m = M + 1, n = N + 1, k_start=1),
-                                 model.MatrixDiagonalIndexIterator(m = M, n= N, k_start=0)):
-        d1 = dtw_matrix[n_m1, m] # shape(number_of_considered_values)
-        d2 = dtw_matrix[n_m1, m_m1]
-        max_values = np.maximum(d1, d2)
+    for (m, n), (m_m1, n_m1) in zip(model.MatrixDiagonalIndexIterator(m=M + 1, n=N + 1, k_start=1),
+                                    model.MatrixDiagonalIndexIterator(m=M, n=N, k_start=0)):
+        max_values = np.maximum(dtw_matrix[n_m1, m], dtw_matrix[n_m1, m_m1])
         dtw_matrix[n, m] = score_matrix[0, n_m1, m_m1] + max_values
-    return dtw_matrix[1:N+1, 1:M+1]
 
-
+    return dtw_matrix[1:N + 1, 1:M + 1]
 
 def optimal_alignment_path(matrix, init=200):
     """
@@ -118,29 +104,24 @@ def optimal_alignment_path(matrix, init=200):
 
     # forward step DTW
     accumulated_scores = accumulated_cost_numpy(matrix, init=init)
-
     N, M = accumulated_scores.shape
 
-    optimal_path_matrix = np.zeros((N, M))
-    optimal_path_matrix[-1, -1] = 1  # last phoneme is active at last time frame
-    # backtracking: go backwards through time steps n and put value of active m to 1 in optimal_path_matrix
-    n = N - 2
-    m = M - 1
+    path = np.zeros((N, M))
+    path[-1, -1] = 1
 
+    n, m = N - 2, M - 1
     while m > 0:
         d1 = accumulated_scores[n, m]  # score at n of optimal phoneme at n-1
         d2 = accumulated_scores[n, m - 1]  # score at n of phoneme before optimal phoneme at n-1
         arg_max = np.argmax([d1, d2])  # = 0 if same phoneme active as before, = 1 if previous phoneme active
-        optimal_path_matrix[n, m - arg_max] = 1
+        path[n, m - arg_max] = 1
         n -= 1
         m -= arg_max
         if n == -2:
-            print("DTW backward pass failed. n={} but m={}".format(n, m))
+            print(f"DTW failed. n={n}, m={m}")
             break
-    optimal_path_matrix[0:n+1, 0] = 1
-
-    return optimal_path_matrix
-
+    path[0:n+1, 0] = 1
+    return path
 
 def make_phoneme_and_word_list(text_file, word2phoneme_dict):
     word_list = []
@@ -162,107 +143,164 @@ def make_phoneme_and_word_list(text_file, word2phoneme_dict):
     return lyrics_phoneme_symbols, word_list
 
 def make_phoneme_list(text_file):
-    lyrics_phoneme_symbols = []
-    with open(text_file, encoding='utf-8') as lyrics:
-        lines = lyrics.readlines()
-        for line in lines:
-            phoneme = line.replace('\n', '').upper()
-            if phoneme in [' ', '']: continue
-            lyrics_phoneme_symbols.append(phoneme)
-    return lyrics_phoneme_symbols
+    """
+    Extract phoneme list directly from a phoneme-based lyrics file.
+    """
+    with open(text_file, encoding='utf-8') as f:
+        return [line.strip().upper() for line in f if line.strip() and line.strip() != ' ']
 
+def convert_onsets_tsv_to_textgrid(onset_file_path, grid_file_path):
+    """
+    Converts phoneme onsets TSV file to Praat TextGrid format.
+    """
+    pointList = []
+    with open(onset_file_path, 'r') as fi:
+        for line in fi:
+            phoneme, onset = line.split('\t')
+            phoneme = '' if phoneme == '>' else phoneme
+            pointList.append((phoneme, float(onset)))
+
+    # Add the last point for duration
+    duration = pointList[-1][1] + 1.0
+    pointList.append(('', duration))
+
+    # Create intervals
+    newEntries = [(pointList[i][1], pointList[i + 1][1], pointList[i][0]) for i in range(len(pointList) - 1)]
+
+    # Create TextGrid
+    outputTG = textgrid.Textgrid()
+    tier = textgrid.IntervalTier("phons", newEntries, 0, duration)
+    outputTG.addTier(tier)
+
+    # Save to file
+    outputTG.save(grid_file_path, "short_textgrid", True)
+
+def find_files_in_directory(input_dir):
+    """
+    Recursively finds all text and audio files in the given directory and its subdirectories.
+    """
+    lyrics_files, audio_files = [], []
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if file.endswith('.txt'):
+                lyrics_files.append(os.path.join(root, file))
+            elif file.endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a')):
+                audio_files.append(os.path.join(root, file))
+    return lyrics_files, audio_files
+
+
+def process_onset_files(onset_type, output_file_dir, file_name, phonemes, phoneme_onsets, dataset_name, words=None):
+    """
+    Process onset files (phoneme or word onsets) and save them in the appropriate directory.
+    """
+    onset_dirs = {'p': 'phoneme_onsets', 'w': 'word_onsets'}
+    onset_dir = os.path.join(output_file_dir, f"{dataset_name}_{onset_dirs[onset_type]}")
+
+    # Create the directory only once if it doesn't exist
+    os.makedirs(onset_dir, exist_ok=True)
+
+    # Write onset times to the corresponding file
+    onset_file_path = os.path.join(onset_dir, f'{file_name}.txt')
+    with open(onset_file_path, 'w') as f:
+        for item, onset in zip(phonemes if onset_type == 'p' else words, phoneme_onsets):
+            f.write(f'{item}\t{onset}\n')
+
+    # Convert phoneme onsets to TextGrid if phonemes are being processed
+    if onset_type == 'p':
+        grid_file_path = os.path.join(onset_dir, f'{file_name}_TextGrid.txt')
+        convert_onsets_tsv_to_textgrid(onset_file_path, grid_file_path)
 
 if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser(description='Lyrics aligner')
-
-    parser.add_argument('audio_path', type=str)
-    parser.add_argument('lyrics_path', type=str)
-    parser.add_argument('--lyrics-format', type=str, choices=['w', 'p'], default='w')
-    parser.add_argument('--onsets', type=str, choices=['p', 'w', 'pw'], default='p')
-    parser.add_argument('--dataset-name', type=str, default='dataset1')
+    parser = argparse.ArgumentParser(description='Lyrics aligner by phoneme/word')
+    parser.add_argument('input_dir', type=str, default='inputs', nargs='?', help='Directory containing both audio and lyrics')
+    parser.add_argument('--lyrics-format', choices=['w', 'p'], default='w')
+    parser.add_argument('--onsets', choices=['p', 'w', 'pw'], default='p')
+    parser.add_argument('--dataset-name', default='dataset1')
     parser.add_argument('--vad-threshold', type=float, default=0)
     args = parser.parse_args()
 
-    audio_files = sorted(glob.glob(os.path.join(args.audio_path, '*')))
+    # Find lyrics and audio files recursively within the input directory
+    lyrics_files, audio_files = find_files_in_directory(args.input_dir)
 
-    pickle_in = open('files/{}_word2phonemes.pickle'.format(args.dataset_name), 'rb')
-    word2phonemes = pickle.load(pickle_in)
-    pickle_in = open('files/phoneme2idx.pickle', 'rb')
-    phoneme2idx = pickle.load(pickle_in)
+    # Load necessary files for phoneme to index and word to phoneme dictionary
+    with open(f'bin/{args.dataset_name}_word2phonemes.pickle', 'rb') as f:
+        word2phonemes = pickle.load(f)
+    with open('bin/phoneme2idx.pickle', 'rb') as f:
+        phoneme2idx = pickle.load(f)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Load the pre-trained model
+    state_dict = torch.load('bin/model_parameters.pth', map_location='cpu', weights_only=True)
+    model_instance = model.InformedOpenUnmix3()
+    model_instance.load_state_dict(state_dict)
 
-    device_printed = 'GPU' if torch.cuda.is_available() else 'CPU'
-    print('Running model on {}.'.format(device_printed))
+    # Create output directory structure
+    output_dir = f'outputs/'
 
-    # load model
-    lyrics_aligner = model.InformedOpenUnmix3().to(device)
-    state_dict = torch.load('model_parameters.pth', map_location=device)
-    lyrics_aligner.load_state_dict(state_dict)
+    # Process each lyrics file and find the corresponding audio
+    for lyrics_path in lyrics_files:
+        file_name = os.path.splitext(os.path.basename(lyrics_path))[0]
 
-    if args.onsets in ['p', 'pw']:
-        os.makedirs('outputs/{}/phoneme_onsets'.format(args.dataset_name), exist_ok=True)
-    if args.onsets in ['w', 'pw']:
-        os.makedirs('outputs/{}/word_onsets'.format(args.dataset_name), exist_ok=True)
+        # Try to find the corresponding audio file
+        audio_path = next((audio for audio in audio_files if os.path.splitext(os.path.basename(audio))[0] == file_name), None)
 
-    for audio_file_path in audio_files:
+        if audio_path is None:
+            print(f"Error: Audio file for {lyrics_path} not found. Skipping.")
+            continue  # Skip this iteration and go to the next one
 
-        audio_file = os.path.basename(audio_file_path)
-        print('Processing {} ...'.format(audio_file))
-        file_name, ext = os.path.splitext(audio_file)
+        if len([audio for audio in audio_files if os.path.splitext(os.path.basename(audio))[0] == file_name]) > 1:
+            print(f"Error: Multiple audio files found for {lyrics_path}. Skipping.")
+            continue  # Skip this iteration and go to the next one
 
-        # get corresponding lyrics file
-        lyrics_file_path = os.path.join(args.lyrics_path, file_name + '.txt')
+        # Create a folder for the output
+        output_file_dir = os.path.join(output_dir, file_name)
 
+        # Check and print audio format preference
+        print(f"Processing: {audio_path} <+> {lyrics_path} = {output_file_dir}")
+        if not audio_path.endswith('.wav'):
+            print(f"  Warning: Use Audio File on .wav format, if possible (currently using .{audio_path.split('.')[-1].upper()})")
+
+        # Process lyrics based on the selected format
         if args.lyrics_format == 'w':
-            lyrics_phoneme_symbols, word_list = make_phoneme_and_word_list(lyrics_file_path, word2phonemes)
-        elif args.lyrics_format == 'p':
-            lyrics_phoneme_symbols = make_phoneme_list(lyrics_file_path)
+            print(f'  Using dictionary: bin/{args.dataset_name}_word2phonemes.pickle')
+            phonemes, words = make_phoneme_and_word_list(lyrics_path, word2phonemes)
+        else:
+            phonemes = make_phoneme_list(lyrics_path)
 
-        lyrics_phoneme_idx = [phoneme2idx[p] for p in lyrics_phoneme_symbols]
-        phonemes_idx = torch.tensor(lyrics_phoneme_idx, dtype=torch.float32, device=device)[None, :]
+        # Convert phonemes to indices and prepare for model input
+        phoneme_idx = [phoneme2idx[p] for p in phonemes]
+        phoneme_tensor = torch.tensor(phoneme_idx, dtype=torch.float32).unsqueeze(0)
 
-        # audio processing: load, resample, to mono, to torch
-        audio, sr = lb.load(audio_file_path, sr=16000, mono=True)
-        audio_torch = torch.tensor(audio, dtype=torch.float32, device=device)[None, None, :]
+        # Load and resample the audio file
+        audio, sr = lb.load(audio_path, sr=None, mono=True)
+        if sr != 16000:
+            audio = lb.resample(audio, orig_sr=sr, target_sr=16000)
 
-        # compute alignment
+        audio_tensor = torch.tensor(audio, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
         with torch.no_grad():
-            voice_estimate, _, scores = lyrics_aligner((audio_torch, phonemes_idx))
+            voice_estimate, _, scores = model_instance((audio_tensor, phoneme_tensor))
             scores = scores.cpu()
 
+        # Perform Voice Activity Detection (VAD) if necessary
         if args.vad_threshold > 0:
-            # vocal activity detection
-            voice_estimate = voice_estimate[:, 0, 0, :].cpu().numpy().T
-            vocals_mag = np.sum(voice_estimate, axis=0)
+            voice_mag = voice_estimate[:, 0, 0, :].cpu().numpy().T
+            silence_frames = np.where(np.sum(voice_mag, axis=0) < args.vad_threshold)[0]
+            space_token_idx = torch.nonzero(phoneme_tensor == 3, as_tuple=True)[1]
+            for n in silence_frames:
+                scores[:, n, space_token_idx] = scores.max()
 
-            # frames with vocal magnitude below threshold are considered silence
-            predicted_silence = np.nonzero(vocals_mag < args.vad_threshold)
+        # Find the optimal alignment path for phonemes
+        path = optimal_alignment_path(scores)
 
-            is_space_token = torch.nonzero(phonemes_idx == 3, as_tuple=True)
+        # Compute phoneme onsets and process them
+        phoneme_onsets = compute_phoneme_onsets(path, hop_len=256, samp_rate=16000)
 
-            # set score of space tokens to high value in silent frames
-            for n in predicted_silence[0]:
-                scores[:, n, is_space_token[1]] = scores.max()
+        # Process and save phoneme and word onsets if requested
+        if args.onsets == 'p' or args.onsets == 'pw':
+            process_onset_files('p', output_file_dir, file_name, phonemes, phoneme_onsets, args.dataset_name)
 
-        optimal_path = optimal_alignment_path(scores)
-        phoneme_onsets = compute_phoneme_onsets(optimal_path, hop_length=256, sampling_rate=16000)
-
-        if args.onsets in ['p', 'pw']:
-            # save phoneme onsets
-            p_file = open('outputs/{}/phoneme_onsets/{}.txt'.format(args.dataset_name, file_name), 'a')
-            for m, symb in enumerate(lyrics_phoneme_symbols):
-                p_file.write(symb + '\t' + str(phoneme_onsets[m]) + '\n')
-            p_file.close()
-
-        if args.onsets in ['w', 'pw']:
-            word_onsets, word_offsets = compute_word_alignment(lyrics_phoneme_symbols, phoneme_onsets)
-
-            # save word onsets
-            w_file = open('outputs/{}/word_onsets/{}.txt'.format(args.dataset_name, file_name), 'a')
-            for m, word in enumerate(word_list):
-                w_file.write(word + '\t' + str(word_onsets[m]) + '\n')
-            w_file.close()
+        if args.onsets == 'w' or args.onsets == 'pw':
+            word_onsets, word_offsets = compute_word_alignment(phonemes, phoneme_onsets)
+            process_onset_files('w', output_file_dir, file_name, phonemes, word_onsets, args.dataset_name, words)
 
         print('Done.')

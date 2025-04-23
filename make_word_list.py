@@ -35,7 +35,7 @@ for file in lyrics_files:
 unique_words.remove('')
 
 # create .txt-file
-word_file_path = 'files/{}_word_list.txt'.format(args.dataset_name)
+word_file_path = 'outputs/{}_word_list.txt'.format(args.dataset_name)
 assert not os.path.isfile(word_file_path), 'file {} exists already. Delete or choose different' \
                                            ' file to avoid appending to existing file'.format(word_file_path)
 
@@ -46,7 +46,7 @@ for word in sorted(unique_words):
 words_file.close()
 
 # create empty .txt-file which will contain the output of the CMU pronuciation dictionary.
-empty_file_path =  'files/{}_word2phonemes.txt'.format(args.dataset_name)
+empty_file_path =  'bin/{}_word2phonemes.txt'.format(args.dataset_name)
 empty_file = open(empty_file_path, 'a')
 empty_file.write('')
 empty_file.close()
