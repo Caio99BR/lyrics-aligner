@@ -94,65 +94,72 @@ def sakoe_chiba_band(i_list, j_list, m, n, bandwidth=1):
 def dtw_matrix(scores, mode='faster', idx_to_skip=None):
     """
     Computes the accumulated score matrix by the "DTW forward operation"
+
     Args:
-        scores: score matrix, shape(batch_size, length_sequence1, length_sequence2)
-        mode:
-        idx: list of indices,
-             in mode 'skip_idx_faster' the possibility of skiping phonemes with given idx is considered
+        scores (torch.Tensor): Score matrix of shape (batch_size, seq_len1, seq_len2)
+        mode (str): Mode of operation, currently supports 'faster'
+        idx_to_skip (list[int], optional): Unused in current mode
 
     Returns:
-        dtw_matrix: accumulated scores, shape (batch_size, length_sequence1, length_sequence2)
-
+        torch.Tensor: Accumulated DTW matrix of shape (batch_size, seq_len1, seq_len2)
     """
-    B, N, M = scores.size()
+    B, N, M = scores.shape
     device = scores.device
 
     if mode == 'faster':
-        # there is an issue with pytorch backward computation when using 'faster' with pytorch 1.2.0:
-        # https://github.com/pytorch/pytorch/issues/24853
-        dtw_matrix = torch.ones((B, N+1, M+1), device=device) * -100000
+        dtw_matrix = torch.full((B, N + 1, M + 1), fill_value=-1e5, device=device)
+        dtw_matrix[:, 0, 0] = 2e5
 
-        dtw_matrix[:, 0, 0] = torch.ones((B,), device=device) * 200000
-        # Sweep diagonally through alphas (as done in https://github.com/lyprince/sdtw_pytorch/blob/master/sdtw.py)
-        # See also https://towardsdatascience.com/gpu-optimized-dynamic-programming-8d5ba3d7064f
-        for (m,n),(m_m1,n_m1) in zip(MatrixDiagonalIndexIterator(m = M + 1, n = N + 1, k_start=1),
-                                     MatrixDiagonalIndexIterator(m = M, n= N, k_start=0)):
+        for (m, n), (m_m1, n_m1) in zip(
+            MatrixDiagonalIndexIterator(m=M + 1, n=N + 1, k_start=1),
+            MatrixDiagonalIndexIterator(m=M, n=N, k_start=0)
+        ):
+            d1 = dtw_matrix[:, n_m1, m].unsqueeze(-1)
+            d2 = dtw_matrix[:, n_m1, m_m1].unsqueeze(-1)
+            max_vals = torch.maximum(d1, d2).squeeze(-1)
+            dtw_matrix[:, n, m] = scores[:, n_m1, m_m1] + max_vals
 
-            d1 = dtw_matrix[:, n_m1, m].unsqueeze(2) # shape(B, number_of_considered_values, 1)
-            d2 = dtw_matrix[:, n_m1, m_m1].unsqueeze(2)
-            max_values, idx = torch.max(torch.cat([d1, d2], dim=2), dim=2)
-            dtw_matrix[:, n, m] = scores[:, n_m1, m_m1] + max_values
         return dtw_matrix[:, 1:N+1, 1:M+1]
 
 
 def optimal_alignment_path(matrix):
-
     # matrix is torch.tensor with size (1, sequence_length1, sequence_length2)
 
-    # forward step DTW
+    # Forward step DTW
     accumulated_scores = dtw_matrix(matrix, mode='faster')
     accumulated_scores = accumulated_scores.cpu().detach().squeeze(0).numpy()
 
     N, M = accumulated_scores.shape
 
-    optimal_path_matrix = np.zeros((N, M))
+    # Optimal path matrix initialization
+    optimal_path_matrix = np.zeros((N, M), dtype=int)
     optimal_path_matrix[-1, -1] = 1  # last phoneme is active at last time frame
-    # backtracking: go backwards through time steps n and put value of active m to 1 in optimal_path_matrix
-    n = N - 2
-    m = M - 1
 
+    # Backtracking: go backwards through time steps
+    n, m = N - 2, M - 1
 
     while m > 0:
-        d1 = accumulated_scores[n, m]  # score at n of optimal phoneme at n-1
-        d2 = accumulated_scores[n, m - 1]  # score at n of phoneme before optimal phoneme at n-1
-        arg_max = np.argmax([d1, d2])  # = 0 if same phoneme active as before, = 1 if previous phoneme active
+        # Fetch the previous scores
+        d1, d2 = accumulated_scores[n, m], accumulated_scores[n, m - 1]
+
+        # Find the path with the highest score
+        arg_max = np.argmax([d1, d2])  # 0 if same phoneme active, 1 if previous phoneme active
+
+        # Mark the active phoneme in the path
         optimal_path_matrix[n, m - arg_max] = 1
+
+        # Update indices for backtracking
         n -= 1
         m -= arg_max
+
+        # Error handling: Ensure n doesn't go out of bounds
         if n == -2:
-            print("DTW backward pass failed. n={} but m={}".format(n, m))
+            print(f"DTW backward pass failed. n={n}, m={m}")
             break
-    optimal_path_matrix[0:n+1, 0] = 1
+
+    # Ensure that the first column of the optimal path is fully marked
+    optimal_path_matrix[:n + 1, 0] = 1
+
     return optimal_path_matrix  # numpy array with shape (N, M)
 
 
@@ -176,17 +183,11 @@ def pad_for_stft(signal, hop_length):
 
 
 class STFT(nn.Module):
-    def __init__(
-        self,
-        n_fft=4096,
-        n_hop=1024,
-        center=False
-    ):
+    def __init__(self, n_fft=4096, n_hop=1024, center=False):
         super(STFT, self).__init__()
-        self.window = nn.Parameter(
-            torch.hann_window(n_fft),
-            requires_grad=False
-        )
+
+        # Window initialization: no gradient needed
+        self.window = nn.Parameter(torch.hann_window(n_fft), requires_grad=False)
 
         self.n_fft = n_fft
         self.n_hop = n_hop
@@ -195,31 +196,31 @@ class STFT(nn.Module):
     def forward(self, x):
         """
         Input: (nb_samples, nb_channels, nb_timesteps)
-        Output:(nb_samples, nb_channels, nb_bins, nb_frames, 2)
+        Output: (nb_samples, nb_channels, nb_bins, nb_frames)
         """
+        nb_samples, nb_channels, nb_timesteps = x.shape
 
-        nb_samples, nb_channels, nb_timesteps = x.size()
+        # Merge nb_samples and nb_channels for multichannel stft computation
+        x = x.view(nb_samples * nb_channels, nb_timesteps)
 
-        # merge nb_samples and nb_channels for multichannel stft
-        x = x.reshape(nb_samples*nb_channels, -1)
-
-        # compute stft with parameters as close as possible scipy settings
+        # Compute the STFT (torch.stft is optimized for batch operations)
         stft_f = torch.stft(
             x,
-            n_fft=self.n_fft, hop_length=self.n_hop,
-            window=self.window, center=self.center,
-            normalized=False, onesided=True,
-            pad_mode='reflect'
-        )
+            n_fft=self.n_fft,
+            hop_length=self.n_hop,
+            window=self.window,
+            center=self.center,
+            normalized=False,
+            onesided=True,
+            pad_mode='reflect',
+            return_complex=True
+        )  # shape: (nb_samples * nb_channels, nb_bins, nb_frames)
 
-        # reshape back to channel dimension
-        stft_f = stft_f.contiguous().view(
-            nb_samples, nb_channels, self.n_fft // 2 + 1, -1, 2
-        )
+        # Reshape: (nb_samples, nb_channels, nb_bins, nb_frames)
+        nb_bins, nb_frames = stft_f.shape[1], stft_f.shape[2]
+        stft_f = stft_f.view(nb_samples, nb_channels, nb_bins, nb_frames)
 
-        # shape (nb_samples, nb_channels, nb_bins, nb_frames, 2)
         return stft_f
-
 
 class Spectrogram(nn.Module):
     def __init__(
@@ -234,20 +235,21 @@ class Spectrogram(nn.Module):
     def forward(self, stft_f):
         """
         Input: complex STFT
-            (nb_samples, nb_channels, nb_bins, nb_frames, 2)
+            (nb_samples, nb_channels, nb_bins, nb_frames)
         Output: Power/Mag Spectrogram
             (nb_frames, nb_samples, nb_channels, nb_bins)
         """
         stft_f = stft_f.transpose(2, 3)
+
         # take the magnitude
-        stft_f = stft_f.pow(2).sum(-1).pow(self.power / 2.0)
+        stft_f = stft_f.abs().pow(self.power)
 
         # downmix in the mag domain
         if self.mono:
             stft_f = torch.mean(stft_f, 1, keepdim=True)
 
         # permute output for LSTM convenience
-        return stft_f.permute(2, 0, 1, 3)
+        return stft_f.permute(2, 0, 1, 3)  # (nb_frames, nb_samples, nb_channels, nb_bins)
 
 
 def index2one_hot(index_tensor, vocabulary_size):
@@ -298,220 +300,138 @@ class InformedOpenUnmix3(nn.Module):
         Output: Power/Mag Spectrogram
                 (nb_frames, nb_samples, nb_channels, nb_bins)
         """
-
         super(InformedOpenUnmix3, self).__init__()
 
         self.return_alphas = False
         self.optimal_path_alphas = False
 
-        # text processing
+        # Text processing
         self.vocab_size = vocab_size
+        self.lstm_txt = LSTM(vocab_size, hidden_size // 2, num_layers=1, batch_first=True, bidirectional=True)
 
-        self.lstm_txt = LSTM(vocab_size, hidden_size//2, num_layers=1, batch_first=True, bidirectional=True)
-
-        # attention
+        # Attention
         w_s_init = torch.empty(hidden_size, hidden_size)
-        k = torch.sqrt(torch.tensor(1).type(torch.float32) / hidden_size)
-        nn.init.uniform_(w_s_init, -k, k)
-        self.w_s = nn.Parameter(w_s_init, requires_grad=True)
+        nn.init.uniform_(w_s_init, -torch.sqrt(torch.tensor(1., dtype=torch.float32) / hidden_size),
+                         torch.sqrt(torch.tensor(1., dtype=torch.float32) / hidden_size))
+        self.w_s = nn.Parameter(w_s_init)
 
-        # connection
-        self.fc_c = Linear(hidden_size * 2, hidden_size)
-        self.bn_c = BatchNorm1d(hidden_size)
+        # Connection
+        self.fc_c = nn.Linear(hidden_size * 2, hidden_size)
+        self.bn_c = nn.BatchNorm1d(hidden_size)
 
         self.nb_output_bins = n_fft // 2 + 1
-        if max_bin:
-            self.nb_bins = max_bin
-        else:
-            self.nb_bins = self.nb_output_bins
-
+        self.nb_bins = max_bin if max_bin else self.nb_output_bins
         self.hidden_size = hidden_size
 
+        # Audio transform and STFT
         self.stft = STFT(n_fft=n_fft, n_hop=n_hop)
         self.spec = Spectrogram(power=power, mono=(nb_channels == 1))
         self.register_buffer('sample_rate', torch.tensor(sample_rate))
 
-        if input_is_spectrogram:
-            self.transform = NoOp()
-        elif audio_transform == 'STFT':
-            self.transform = nn.Sequential(self.stft, self.spec)
+        self.transform = nn.Sequential(self.stft, self.spec) if not input_is_spectrogram else nn.Identity()
 
-        # audio encoder
-        self.fc1 = Linear(
-            self.nb_bins*nb_channels, hidden_size,
-            bias=False
-        )
+        # Audio encoder
+        self.fc1 = nn.Linear(self.nb_bins * nb_channels, hidden_size, bias=False)
+        self.bn1 = nn.BatchNorm1d(hidden_size)
 
-        self.bn1 = BatchNorm1d(hidden_size)
-
-        if unidirectional:
-            lstm_hidden_size = hidden_size
-        else:
-            lstm_hidden_size = hidden_size // 2
-
+        lstm_hidden_size = hidden_size if unidirectional else hidden_size // 2
         self.audio_encoder_lstm = LSTM(input_size=hidden_size, hidden_size=lstm_hidden_size,
                                        num_layers=audio_encoder_layers, bidirectional=not unidirectional,
                                        batch_first=False, dropout=0.4)
 
+        # LSTM layers
+        self.lstm = LSTM(input_size=hidden_size, hidden_size=lstm_hidden_size, num_layers=nb_layers,
+                         bidirectional=not unidirectional, batch_first=False, dropout=0.4)
 
-        self.lstm = LSTM(
-            input_size=hidden_size,
-            hidden_size=lstm_hidden_size,
-            num_layers=nb_layers,
-            bidirectional=not unidirectional,
-            batch_first=False,
-            dropout=0.4,
-        )
+        self.fc2 = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
 
-        self.fc2 = Linear(
-            in_features=hidden_size*2,
-            out_features=hidden_size,
-            bias=False
-        )
+        self.fc3 = nn.Linear(hidden_size, self.nb_output_bins * nb_channels, bias=False)
+        self.bn3 = nn.BatchNorm1d(self.nb_output_bins * nb_channels)
 
-        self.bn2 = BatchNorm1d(hidden_size)
-
-        self.fc3 = Linear(
-            in_features=hidden_size,
-            out_features=self.nb_output_bins*nb_channels,
-            bias=False
-        )
-
-        self.bn3 = BatchNorm1d(self.nb_output_bins*nb_channels)
-
-        if input_mean is not None:
-            input_mean = torch.from_numpy(
-                -input_mean[:self.nb_bins]
-            ).float()
-        else:
-            input_mean = torch.zeros(self.nb_bins)
-
-        if input_scale is not None:
-            input_scale = torch.from_numpy(
-                1.0/input_scale[:self.nb_bins]
-            ).float()
-        else:
-            input_scale = torch.ones(self.nb_bins)
-
-        self.input_mean = Parameter(input_mean)
-        self.input_scale = Parameter(input_scale)
-
-        self.output_scale = Parameter(
-            torch.ones(self.nb_output_bins).float()
-        )
-        self.output_mean = Parameter(
-            torch.ones(self.nb_output_bins).float()
-        )
+        # Input mean/scale handling
+        self.input_mean = nn.Parameter(torch.tensor(input_mean[:self.nb_bins] if input_mean is not None else [0.] * self.nb_bins).float())
+        self.input_scale = nn.Parameter(torch.tensor(1.0 / input_scale[:self.nb_bins] if input_scale is not None else [1.] * self.nb_bins).float())
+        self.output_scale = nn.Parameter(torch.ones(self.nb_output_bins).float())
+        self.output_mean = nn.Parameter(torch.ones(self.nb_output_bins).float())
 
     @classmethod
     def from_config(cls, config: dict):
-        keys = config.keys()
-        scaler_mean = config['scaler_mean'] if 'scaler_mean' in keys else None
-        scaler_std = config['scaler_std'] if 'scaler_std' in keys else None
-        attention = config['attention'] if 'attention' in keys else 'general'
-        return cls(input_mean=scaler_mean,
-                   input_scale=scaler_std,
-                   nb_channels=config['nb_channels'],
-                   hidden_size=config['hidden_size'],
-                   n_fft=config['nfft'],
-                   n_hop=config['nhop'],
-                   max_bin=config['max_bin'],
-                   sample_rate=config['samplerate'],
-                   vocab_size=config['vocabulary_size'],
-                   audio_encoder_layers=config['nb_audio_encoder_layers'],
-                   attention=attention)
+        return cls(
+            input_mean=config.get('scaler_mean', None),
+            input_scale=config.get('scaler_std', None),
+            nb_channels=config['nb_channels'],
+            hidden_size=config['hidden_size'],
+            n_fft=config['nfft'],
+            n_hop=config['nhop'],
+            max_bin=config['max_bin'],
+            sample_rate=config['samplerate'],
+            vocab_size=config['vocabulary_size'],
+            audio_encoder_layers=config['nb_audio_encoder_layers'],
+            attention=config.get('attention', 'general')
+        )
 
     def forward(self, x):
-
-        text_idx = x[1].unsqueeze(dim=2)  # text as index sequence
+        text_idx = x[1].unsqueeze(dim=2)
         x = x[0]  # mix
 
         x = self.transform(x)
-        nb_frames, nb_samples, nb_channels, nb_bins = x.data.shape
+        nb_frames, nb_samples, nb_channels, nb_bins = x.shape
 
-        # -------------------------------------------------------------------------------------------------------------
-        # text processing
-        text_onehot = index2one_hot(text_idx, self.vocab_size)  # shape (nb_samples, sequence_len, vocabulary_size)
+        # Text processing
+        text_onehot = index2one_hot(text_idx, self.vocab_size)
+        h, _ = self.lstm_txt(text_onehot)
 
-        h, _ = self.lstm_txt(text_onehot)  # lstm expects shape (batch_size, sequence_len, nb_features)
-
-        # -------------------------------------------------------------------------------------------------------------
-        # audio processing
-
+        # Audio processing
         mix = x.detach().clone()
-
-        # crop
-        x = x[..., :self.nb_bins]
-
-        # shift and scale input to mean=0 std=1 (across all bins)
+        x = x[..., :self.nb_bins]  # Crop to max bin
         x += self.input_mean
         x *= self.input_scale
 
-        # to (nb_frames*nb_samples, nb_channels*nb_bins)
-        # and encode to (nb_frames*nb_samples, hidden_size)
-        x = self.fc1(x.reshape(-1, nb_channels*self.nb_bins))
-        # normalize every instance in a batch
+        # Encode audio features
+        x = self.fc1(x.reshape(-1, nb_channels * self.nb_bins))
         x = self.bn1(x)
-        x = x.reshape(nb_frames, nb_samples, self.hidden_size)
-        # squash range ot [-1, 1]
-        x = torch.tanh(x)
+        x = torch.tanh(x.reshape(nb_frames, nb_samples, self.hidden_size))
 
         x, _ = self.audio_encoder_lstm(x)
 
-        # -------------------------------------------------------------------------------------------------------------
-        # attention
+        # Attention mechanism
         batch_size = h.size(0)
-        x = x.transpose(0, 1)  # to shape (nb_samples, nb_frames, self.hidden_size)
-
-        # compute score = g_n * W_s * h_m in two steps
-        side_info_transformed = torch.bmm(self.w_s.expand(batch_size, -1, -1),
-                                          torch.transpose(h, 1, 2))
-
+        x = x.transpose(0, 1)  # Shape (nb_samples, nb_frames, hidden_size)
+        side_info_transformed = torch.bmm(self.w_s.expand(batch_size, -1, -1), h.transpose(1, 2))
         scores = torch.bmm(x, side_info_transformed)
         dtw_alphas = dtw_matrix(scores, mode='faster')
         alphas = F.softmax(dtw_alphas, dim=2)
 
+        # Compute context vectors
+        context = torch.bmm(h.transpose(1, 2), alphas.transpose(1, 2))
+        context = context.transpose(1, 2)
 
-        # compute context vectors
-        context = torch.bmm(torch.transpose(h, 1, 2), torch.transpose(alphas, 1, 2))
-
-        # make shape: (nb_samples, N, hidden_size)
-        context = torch.transpose(context, 1, 2)
-
-        # -------------------------------------------------------------------------------------------------------------
-        # connection of audio and text
+        # Connection of audio and text
         concat = torch.cat((context, x), dim=2)
         x = self.fc_c(concat)
-        x = self.bn_c(x.transpose(1, 2))  # (nb_samples, hidden_size, nb_frames)
-        x = torch.tanh(x)
+        x = self.bn_c(x.transpose(1, 2))
+        x = torch.tanh(x).transpose(1, 2).transpose(0, 1)
 
-        x = x.transpose(1, 2)
-        x = x.transpose(0, 1)  # --> (nb_frames, nb_samples, hidden_size)
-
-        # apply 3-layers of stacked LSTM
+        # Apply stacked LSTMs
         lstm_out = self.lstm(x)
-
-        # lstm skip connection
         x = torch.cat([x, lstm_out[0]], -1)
 
-        # first dense stage + batch norm
+        # Dense layers with batch normalization
         x = self.fc2(x.reshape(-1, x.shape[-1]))
         x = self.bn2(x)
-
         x = F.relu(x)
 
-        # second dense stage + layer norm
+        # Second dense stage
         x = self.fc3(x)
         x = self.bn3(x)
 
-        # reshape back to original dim
+        # Reshape back to original dimensions
         x = x.reshape(nb_frames, nb_samples, nb_channels, self.nb_output_bins)
 
-        # apply output scaling
+        # Output scaling
         x *= self.output_scale
         x += self.output_mean
 
-        # since our output is non-negative, we can apply RELU
-        x = F.relu(x) * mix
-
-        return x, alphas, scores
+        # Apply ReLU and mix the result
+        return F.relu(x) * mix, alphas, scores
